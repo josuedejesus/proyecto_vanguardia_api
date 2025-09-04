@@ -76,8 +76,21 @@ async function  getTag(request, response) {
     }
 }
 
+async function decrementTagQuantity(id, quantity, trx = null) {
+    try {
+        const query = trx || knex;
+
+        const result = await query('tags').where('uid', id).decrement('product_quantity', quantity);
+
+        return result;
+    } catch (error) {
+        throw error;
+    }
+}
+
 module.exports = {
     getTags,
     createTag,
-    getTag
+    getTag,
+    decrementTagQuantity
 }

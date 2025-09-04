@@ -18,9 +18,11 @@ async function fetchTagByUID(uid) {
     } 
 }
 
-async function insertTag(data) {
+async function insertTag(data, trx = knex) {
     try {
-        const result = await knex('tags').insert(data).returning('uid');
+        const query = trx || knex;
+        
+        const result = await query('tags').insert(data).returning('uid');
         return result;
     } catch (error) {
         throw error;
