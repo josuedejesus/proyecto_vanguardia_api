@@ -114,7 +114,8 @@ async function login(request, response) {
                 lastname: user.lastname,
                 username: user.username,
                 user_role: user.user_role,
-                location_id: location.location_id
+                location_id: location.location_id,
+                location: location.location_name
             },
             process.env.ACCESS_TOKEN_SECRET,
             {

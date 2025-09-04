@@ -48,6 +48,7 @@ router.get("/uid/all", (req, res) => {
 
 function broadcast(evt) {
   const data = JSON.stringify(evt);
+
   for (const res of clients) {
     res.write(`event: ${evt.type || "nfc"}\n`);
     res.write(`data: ${data}\n\n`);
@@ -56,6 +57,7 @@ function broadcast(evt) {
 
 function sendNfc(evt) {
   const now = { ...evt, server_ts: Date.now() };
+
 
   const key = now.reader || "default";
   lastByReader[key] = now;
