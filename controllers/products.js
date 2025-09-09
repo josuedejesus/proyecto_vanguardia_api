@@ -1,6 +1,7 @@
 const { response, move } = require("../app");
 const knex = require("../db/knex");
-const { insertMovement, fetchMovementsByItemId, fetchRawMovementsByItemId, insertItemMovement, fetchItemMovements } = require("../services/movements");
+const { logMovement, fetchChainMovementsByUid, verifyChainEvent } = require("../services/blockchainClient");
+const { insertMovement, fetchMovementsByItemId, fetchRawMovementsByItemId, insertItemMovement, fetchItemMovements, updateMovementHash } = require("../services/movements");
 
 const { fetchProducts, insertBatchType, insertItem, fetchProductBySku, insertProduct, fetchBatchTypes, fetchBatchTypeById, fetchProducById, fetchItem, updateItemStatus, fetchItems, updateItemQuantity, decrementItemQuantity, fetchInventory, fetchItemByUid, fetchProductMovements, fetchItemFamily, fetchItemById, fetchItemsByUid, fetchLocationItem, insertLocationItem, decrementLocationItemQuantity } = require("../services/products");
 const { fetchTagByUID, insertTag } = require("../services/tags");
@@ -80,9 +81,7 @@ async function registerProductEntry(request, response) {
             nfc_uid: entryData.nfc_uid,
         };
 
-        console.log(newBatchType);
 
-        console.log(newItem);
 
         const itemInsertResult = await insertItem(newItem, trx);
 
@@ -140,242 +139,6 @@ async function createBatchType(request, response) {
     }
 }
 
-/*async function divideBatch(request, response) {
-    const trx = await knex.transaction();
-    try {
-        const { itemData } = request.body;
-
-        console.log(itemData);
-
-        const insertResult = await insertItem(itemData, trx);
-
-        if (!insertResult) {
-            throw new Error('Error al crear nuevo lote.');
-        }
-
-        const updateResult = await decrementItemQuantity(itemData.parent_id, itemData.item_quantity, trx);
-
-        if (!updateResult) {
-            throw new Error('Error al actualizar cantidad del lote padre.');
-        }
-
-        const parent = await fetchItemById(itemData.parent_id);
-
-        const tagUpdateResult = await decrementTagQuantity(parent.nfc_uid, itemData.item_quantity, trx);
-
-        if (!tagUpdateResult) {
-            throw new Error('Error al actualizar etiqueta.');
-        }
-
-        const newTag = {
-            uid: itemData.nfc_uid,
-            product_id: itemData.product_id,
-            product_quantity: itemData.item_quantity
-        };
-
-        const tagInsertResult = await insertTag(newTag, trx);
-
-        let movements = [];
-
-        console.log('los movimientos del padre ', itemData.parent_id);
-
-        movements = await fetchRawMovementsByItemId(itemData.parent_id);
-
-        console.log(movements);
-
-
-        for (const movement of movements) {
-            const newMovement = {
-                item_id: insertResult[0].item_id,
-                location_id: movement.location_id,
-                block_hash: movement.block_hash,
-                created_by: movement.created_by,
-                movement_type: movement.movement_type,
-                created_at: movement.created_at
-            };
-
-            const movementInsertResult = await insertMovement(newMovement, trx);
-            if (!movementInsertResult) {
-                throw new Error('Error al crear movimientos.');
-            }
-        }
-
-
-        if (!tagInsertResult) {
-            throw new Error('Error al crear etiqueta.');
-        }
-
-        trx.commit();
-
-        response.send({
-            success: true,
-            details: 'Lote dividido existosamente.'
-        });
-
-
-    } catch (error) {
-        trx.rollback();
-        console.log(error);
-        response.status(500).json({
-            success: false,
-            details: error.message || 'Error al dividir lote.',
-        });
-    }
-}*/
-
-/*async function moveItem(request, response) {
-    const trx = await knex.transaction();
-
-    try {
-        const { uid, locationId, movementType, userId } = request.body;
-
-        const tag = await fetchTagByUID(uid);
-
-        if (!tag) {
-            return response.status(400).send({
-                success: false,
-                details: 'La etiqueta es invalida.'
-            });
-        }
-
-        const product = await fetchProducById(tag.product_id);
-
-        if (!product) {
-            return response.status(400).json({
-                success: false,
-                details: 'El producto asociado a la etiqueta no existe.'
-            });
-        }
-
-        const item = await fetchItem(uid, locationId);
-
-        let itemId;
-
-        if (movementType === 'inbound') {
-            if (item) {
-                itemId = item.item_id;
-                if (item.status === 'IN_STOCK') {
-                    throw new Error('El articulo ya se encuentra en el almacen.');
-                } else if (item.status === 'DISPATCHED') {
-                    let updateResult = await updateItemStatus(item.item_id, 'IN_STOCK');
-                }
-
-            } else {
-
-
-                const existingItem = await fetchItemByUid(uid);
-
-                console.log('Elemento obtenuido por uid', existingItem);
-
-                if (existingItem) {
-                    const itemData = {
-                        product_id: existingItem.product_id,
-                        nfc_uid: existingItem.nfc_uid,
-                        location_id: locationId,
-                        item_quantity: existingItem.item_quantity,
-                        root_id: existingItem.root_id,
-                        parent_id: existingItem.parent_id
-                    };
-
-                    console.log('new produc: ', existingItem);
-
-                    const itemResult = await insertItem(itemData);
-
-                    if (!itemResult) {
-                        throw new Error('Error al crear articulo.');
-                    }
-
-                    itemId = itemResult[0].item_id;
-
-                    const movements = await fetchRawMovementsByItemId(existingItem.item_id);
-                    console.log('movimientos: ', movements);
-                    for (const movement of movements) {
-                        const newMovement = {
-                            item_id: itemId,
-                            location_id: movement.location_id,
-                            block_hash: movement.block_hash,
-                            created_by: movement.created_by,
-                            movement_type: movement.movement_type,
-                            created_at: movement.created_at
-                        };
-
-                        const movementInsertResult = await insertMovement(newMovement, trx);
-                        if (!movementInsertResult) {
-                            throw new Error('Error al crear movimientos.');
-                        }
-                    }
-                } else {
-                    const itemData = {
-                        product_id: product.product_id,
-                        nfc_uid: uid,
-                        location_id: locationId,
-                        item_quantity: tag.product_quantity,
-                    };
-
-                    const itemResult = await insertItem(itemData);
-
-                    itemId = itemResult[0].item_id;
-
-                    if (!itemResult) {
-                        throw new Error('Error al crear articulo.');
-                    }
-                }
-
-            }
-
-        } else if (movementType === 'outbound') {
-            if (item) {
-                itemId = item.item_id;
-                if (item.status === 'DISPATCHED') {
-                    throw new Error('El articulo ya no se encuentra en el almacen.');
-                } else if (item.status === 'IN_STOCK') {
-                    result = await updateItemStatus(item.item_id, 'DISPATCHED');
-                }
-            } else {
-                throw new error('El articulo no existe en el almacen.')
-            }
-        }
-
-        const newMovement = {
-            item_id: itemId,
-            location_id: locationId,
-            block_hash: 'test',
-            created_by: userId,
-            movement_type: movementType,
-            uid: uid
-        };
-
-        const movementResult = await insertMovement(newMovement);
-
-        if (!movementResult) {
-            return response.status(400).send({
-                success: false,
-                details: 'Error al crear movimiento.'
-            })
-        }
-
-        await trx.commit();
-
-        return response.send({
-            success: true,
-            details: 'Movimiento creado exitosamente',
-            data: {
-                tag,
-                product,
-                movementType: movementType
-            }
-        })
-
-    } catch (error) {
-        console.log(error);
-        trx.rollback();
-        response.status(500).json({
-            success: false,
-            details: error.message || 'Error al crear item.',
-        });
-    }
-}*/
-
 async function moveItem(request, response) {
     const trx = await knex.transaction();
 
@@ -414,7 +177,6 @@ async function moveItem(request, response) {
                 item_quantity: tag.product_quantity,
             };
             const insertItemResult = await insertItem(itemData, trx);
-            console.log('id de insert: ', insertItemResult);
             itemId = insertItemResult[0].item_id;
         }
 
@@ -440,7 +202,6 @@ async function moveItem(request, response) {
                     quantity: tag.product_quantity
                 };
 
-                console.log('datos a insertart', itemData);
 
                 const locationItemInsert = await insertLocationItem(itemData, trx);
 
@@ -450,13 +211,11 @@ async function moveItem(request, response) {
             }
 
         } else if (movementType === 'outbound') {
-            console.log('location item: ', locationItem)
             if (locationItem) {
                 if (locationItem.status === 'DISPATCHED') {
                     throw new Error('El articulo ya no se encuentra en el almacen.');
                 } else if (item.status === 'IN_STOCK') {
                     result = await updateItemStatus(locationItem.location_item_id, 'DISPATCHED');
-                    console.log(result);
                     if (!result) {
                         throw new Error('Error al actualizar estado del articulo.');
                     }
@@ -498,6 +257,36 @@ async function moveItem(request, response) {
             })
         }
 
+        //parte del blockchain
+        const ts = Math.floor(new Date(movementResult[0].created_at).getTime() / 1000);
+
+
+        const movementData = {
+            uidHex: String(uid).toUpperCase(),
+
+            movementType: movementType === 'inbound' ? 1 : 2,
+            quantity: tag.product_quantity || 0,
+            locationId: locationId || 0,
+            ts,
+            metadataURI: `${process.env.API_BASE_URL}/movements/${movementResult[0].movement_id}`,
+            jsonFull: {
+                movement_id: movementResult[0].movement_id,
+                sku: product.sku,
+                note: null
+            },
+            idempotencyKey: `mov-${movementResult[0].movement_id}`
+        };
+
+
+        const res = await logMovement(movementData);
+
+        const hashRes = await updateMovementHash(movementResult[0].movement_id, res.txHash, trx);
+
+        if (!hashRes) {
+            throw new Error('Error al actualizar hash.');
+        }
+
+
         await trx.commit();
 
         return response.send({
@@ -511,7 +300,6 @@ async function moveItem(request, response) {
         })
 
     } catch (error) {
-        console.log(error);
         trx.rollback();
         response.status(500).json({
             success: false,
@@ -553,7 +341,6 @@ async function divideBatch(request, response) {
 
         const updateLocationItem = await decrementLocationItemQuantity(itemData.parent_id, itemData.item_quantity, itemData.location_id, trx);
 
-        console.log(updateLocationItem);
 
         if (!updateLocationItem) {
             throw new Error('Error al actualizar cantidad del lote padre.');
@@ -604,7 +391,6 @@ async function divideBatch(request, response) {
 
     } catch (error) {
         trx.rollback();
-        console.log(error);
         response.status(500).json({
             success: false,
             details: error.message || 'Error al dividir lote.',
@@ -622,7 +408,6 @@ async function getWarehouseItems(request, response) {
             data: items
         });
     } catch (error) {
-        console.log(error);
         response.status(400).send({
             success: false,
             details: 'Error al obtener articulos.'
@@ -648,13 +433,18 @@ async function getInventory(request, response) {
     }
 }
 
-async function getProductHistory(request, response) {
+
+/*async function getProductHistory(request, response) {
     try {
         const { uid } = request.body;
 
         const tag = await fetchTagByUID(uid);
 
         const items = await fetchItemsByUid(uid);
+
+        const item = await fetchLocationItem(items[items.length - 1].item_id, items[items.length - 1].location_id);
+
+        console.log('Este es el item que estas viendo.', item);
 
         const product = await fetchProducById(items[0].product_id);
 
@@ -664,8 +454,10 @@ async function getProductHistory(request, response) {
         let parentId;
 
 
-        memeberMovements = await fetchMovementsByItemId(items[items.length - 1].item_id);
-        movements.push(...memeberMovements);
+        movements = await fetchMovementsByItemId(item.item_id);
+
+        console.log('moviemientos del item: ', movements);
+
 
         for (const item of items) {
 
@@ -706,7 +498,8 @@ async function getProductHistory(request, response) {
             uid: uid,
             sku: product.sku,
             product_name: product.product_name,
-            quantity: items[items.length - 1].item_quantity,
+            quantity: item.quantity,
+            status: item.status,
             movements: movements,
             lineage: lineage
         };
@@ -723,6 +516,77 @@ async function getProductHistory(request, response) {
             details: 'Error al obtener historial del producto.'
         });
     }
+}*/
+
+async function getProductHistory(request, response) {
+  try {
+    const { uid } = request.body; 
+
+    const tag = await fetchTagByUID(uid);
+    const items = await fetchItemsByUid(uid);
+    const item = await fetchLocationItem(
+      items[items.length - 1].item_id,
+      items[items.length - 1].location_id
+    );
+    const product = await fetchProducById(items[0].product_id);
+
+    let movements = await fetchMovementsByItemId(item.item_id);
+
+    let lineage = [];
+    for (const it of items) {
+      let parentId = it.parent_id;
+      lineage.push(it);
+      while (parentId != null) {
+        const member = await fetchItemById(parentId);
+        lineage.push(member);
+        parentId = member.parent_id;
+      }
+    }
+    movements.sort((a, b) => a.movement_id - b.movement_id);
+    lineage.sort(
+      (a, b) =>
+        Date.parse(b.updated_at || b.created_at || 0) -
+        Date.parse(a.updated_at || a.created_at || 0)
+    );
+    const seen = new Set();
+    lineage = lineage
+      .filter(x => {
+        const key = x.nfc_uid || String(x.item_id);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .sort((a, b) => a.item_id - b.item_id);
+
+    let movementsChain = [];
+    try {
+      const raw = await fetchChainMovementsByUid(uid);
+      movementsChain = await Promise.all(raw.map(verifyChainEvent));
+      movementsChain.sort((a, b) => a.ts - b.ts);
+    } catch (e) {
+      console.warn("Blockchain fetch failed:", e.message);
+      movementsChain = []; 
+    }
+
+    const data = {
+      uid,
+      sku: product.sku,
+      product_name: product.product_name,
+      quantity: item.quantity,
+      status: item.status,
+      movements,            
+      movements_chain: movementsChain,
+      lineage
+    };
+
+    return response.send({ success: true, data });
+  } catch (error) {
+    console.error(error);
+    return response.status(400).send({
+      success: false,
+      details: "Error al obtener historial del producto."
+    });
+  }
 }
 
 module.exports = {

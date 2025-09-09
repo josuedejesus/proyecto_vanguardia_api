@@ -4,7 +4,7 @@ async function insertMovement(data, trx = null) {
     try {
         const query = trx || knex;
 
-        const result = await query('movements').insert(data).returning('movement_id');
+        const result = await query('movements').insert(data).returning(['movement_id', 'created_at']);
 
         return result;
     } catch (error) {
@@ -29,19 +29,25 @@ async function fetchMovementsByItemId(itemId, trx = null) {
         const query = trx || knex;
 
 
-        const movements = await knex('movements as m')
+        const movements = await (trx || knex)('movements as m')
             .leftJoin('item_movements as im', 'im.movement_id', 'm.movement_id')
             .leftJoin('locations as l', 'l.location_id', 'm.location_id')
+            .leftJoin('location_items as li', function () {
+                this.on('li.item_id', '=', 'im.item_id')
+                    .on('li.location_id', '=', 'm.location_id');
+            })
             .where('im.item_id', itemId)
             .select(
                 'm.movement_id',
                 'm.movement_type',
                 'm.created_at',
                 'm.uid',
-                'l.location_name'
+                'l.location_name',
+                'li.quantity'
             )
             .orderBy('m.created_at', 'asc')
             .orderBy('m.movement_id', 'asc');
+
 
 
         console.log(movements);
@@ -81,10 +87,22 @@ async function fetchItemMovements(itemId, trx = null) {
     }
 }
 
+async function updateMovementHash(movementId, hash, trx = null) {
+    try {
+        const query = trx || knex;
+
+        const result = query('movements').update('block_hash', hash).where('movement_id', movementId);
+        return result;
+    } catch (error) {
+        throw error;
+    }
+}
+
 module.exports = {
     insertMovement,
     fetchMovementsByItemId,
     fetchRawMovementsByItemId,
     insertItemMovement,
-    fetchItemMovements
+    fetchItemMovements,
+    updateMovementHash
 }
