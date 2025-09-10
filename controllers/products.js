@@ -1,6 +1,7 @@
 const { response, move } = require("../app");
 const knex = require("../db/knex");
 const { logMovement, fetchChainMovementsByUid, verifyChainEvent } = require("../services/blockchainClient");
+const { fetchLocationsByIds } = require("../services/locations");
 const { insertMovement, fetchMovementsByItemId, fetchRawMovementsByItemId, insertItemMovement, fetchItemMovements, updateMovementHash } = require("../services/movements");
 
 const { fetchProducts, insertBatchType, insertItem, fetchProductBySku, insertProduct, fetchBatchTypes, fetchBatchTypeById, fetchProducById, fetchItem, updateItemStatus, fetchItems, updateItemQuantity, decrementItemQuantity, fetchInventory, fetchItemByUid, fetchProductMovements, fetchItemFamily, fetchItemById, fetchItemsByUid, fetchLocationItem, insertLocationItem, decrementLocationItemQuantity } = require("../services/products");
@@ -260,7 +261,6 @@ async function moveItem(request, response) {
         //parte del blockchain
         const ts = Math.floor(new Date(movementResult[0].created_at).getTime() / 1000);
 
-
         const movementData = {
             uidHex: String(uid).toUpperCase(),
 
@@ -308,7 +308,8 @@ async function moveItem(request, response) {
     }
 }
 
-async function divideBatch(request, response) {
+
+/*async function divideBatch(request, response) {
     const trx = await knex.transaction();
     try {
         const { itemData } = request.body;
@@ -379,6 +380,35 @@ async function divideBatch(request, response) {
             if (!movementInsertResult) {
                 throw new Error('Error al crear relacion entre articulo y movimiento.');
             }
+
+            //parte del blockchain
+            const ts = Math.floor(new Date(movementResult[0].created_at).getTime() / 1000);
+
+            const movementData = {
+                uidHex: String(uid).toUpperCase(),
+
+                movementType: movementType === 'inbound' ? 1 : 2,
+                quantity: tag.product_quantity || 0,
+                locationId: locationId || 0,
+                ts,
+                metadataURI: `${process.env.API_BASE_URL}/movements/${movementResult[0].movement_id}`,
+                jsonFull: {
+                    movement_id: movementResult[0].movement_id,
+                    sku: product.sku,
+                    note: null
+                },
+                idempotencyKey: `mov-${movementResult[0].movement_id}`
+            };
+
+
+            const res = await logMovement(movementData);
+
+            const hashRes = await updateMovementHash(movementResult[0].movement_id, res.txHash, trx);
+
+            if (!hashRes) {
+                throw new Error('Error al actualizar hash.');
+            }
+
         }
 
         trx.commit();
@@ -396,7 +426,298 @@ async function divideBatch(request, response) {
             details: error.message || 'Error al dividir lote.',
         });
     }
+}*/
+
+async function divideBatch(request, response) {
+  const trx = await knex.transaction();
+  try {
+    const { itemData } = request.body;
+
+    const insertResult = await insertItem(itemData, trx);
+    if (!insertResult) throw new Error('Error al crear nuevo lote.');
+    const newItemId = insertResult[0].item_id;
+
+    const newLocationItem = {
+      location_id: itemData.location_id,
+      item_id: newItemId,
+      quantity: itemData.item_quantity
+    };
+    const locationItemInsert = await insertLocationItem(newLocationItem, trx);
+    if (!locationItemInsert) throw new Error('Error al crear enlace de articulo con bodega.');
+
+    const updateResult = await decrementItemQuantity(itemData.parent_id, itemData.item_quantity, trx);
+    if (!updateResult) throw new Error('Error al actualizar cantidad del lote padre.');
+
+    const updateLocationItem = await decrementLocationItemQuantity(
+      itemData.parent_id, itemData.item_quantity, itemData.location_id, trx
+    );
+    if (!updateLocationItem) throw new Error('Error al actualizar cantidad del lote padre.');
+
+    const parent = await fetchItemById(itemData.parent_id);
+    const tagUpdateResult = await decrementTagQuantity(parent.nfc_uid, itemData.item_quantity, trx);
+    if (!tagUpdateResult) throw new Error('Error al actualizar etiqueta.');
+
+    const newTag = {
+      uid: itemData.nfc_uid,             
+      product_id: itemData.product_id,
+      product_quantity: itemData.item_quantity
+    };
+    const tagInsertResult = await insertTag(newTag, trx);
+    if (!tagInsertResult) throw new Error('Error al crear etiqueta.');
+
+    const movements = await fetchItemMovements(itemData.parent_id);
+    for (const movement of movements) {
+      const newMovementRel = { item_id: newItemId, movement_id: movement.movement_id };
+      const movementInsertResult = await insertItemMovement(newMovementRel, trx);
+      if (!movementInsertResult) throw new Error('Error al crear relacion entre articulo y movimiento.');
+    }
+
+    const ts = Math.floor(Date.now() / 1000);
+    const qty = Number(itemData.item_quantity) || 0;
+    const locId = Number(itemData.location_id) || 0;
+
+    const parentEvent = {
+      uidHex: String(parent.nfc_uid).toUpperCase(),
+      movementType: 6,                 // 6 = Fraccionado (SPLIT)
+      quantity: qty,                   // cantidad que salió del padre
+      locationId: locId,
+      ts,
+      metadataURI: "",                 // sin snapshot
+      jsonFull: {                      // info mínima para auditar relación
+        action: "split_out",
+        parent_item_id: itemData.parent_id,
+        child_item_id: newItemId,
+        parent_uid: String(parent.nfc_uid).toUpperCase(),
+        child_uid: String(itemData.nfc_uid).toUpperCase(),
+        quantity: qty,
+        location_id: locId
+      },
+      idempotencyKey: `split-out-${itemData.parent_id}-${newItemId}-${ts}`
+    };
+
+    // b) Evento para el HIJO (split_in)
+    const childEvent = {
+      uidHex: String(itemData.nfc_uid).toUpperCase(),
+      movementType: 6,                 // mismo código 'Fraccionado'
+      quantity: qty,                   // cantidad con la que nace el hijo
+      locationId: locId,
+      ts,
+      metadataURI: "",                 // sin snapshot
+      jsonFull: {
+        action: "split_in",
+        parent_item_id: itemData.parent_id,
+        child_item_id: newItemId,
+        parent_uid: String(parent.nfc_uid).toUpperCase(),
+        child_uid: String(itemData.nfc_uid).toUpperCase(),
+        quantity: qty,
+        location_id: locId
+      },
+      idempotencyKey: `split-in-${itemData.parent_id}-${newItemId}-${ts}`
+    };
+
+    // Ejecuta ambos (si falla alguno, lanzamos error y hacemos rollback)
+    const bcParent = await logMovement(parentEvent); // { txHash, blockNumber, latestHash }
+    const bcChild  = await logMovement(childEvent);
+
+    // (Opcional) guarda los txHash en alguna tabla para referencia rápida:
+    // await insertChainAudit({
+    //   item_id: itemData.parent_id, kind: 'split_out', tx_hash: bcParent.txHash, ... }, trx);
+    // await insertChainAudit({
+    //   item_id: newItemId, kind: 'split_in', tx_hash: bcChild.txHash, ... }, trx);
+
+    await trx.commit();
+    return response.send({
+      success: true,
+      details: 'Lote dividido exitosamente (on-chain registrado).',
+      data: {
+        parent_tx: bcParent.txHash,
+        child_tx: bcChild.txHash,
+        child_item_id: newItemId
+      }
+    });
+
+  } catch (error) {
+    await trx.rollback();
+    return response.status(500).json({
+      success: false,
+      details: error.message || 'Error al dividir lote.'
+    });
+  }
 }
+
+async function getProductHistory(request, response) {
+  try {
+    // --- UID normalizado ---
+    const rawUid = request.body?.uid ?? request.params?.uid;
+    const uid = String(rawUid || "").toUpperCase().trim();
+    if (!uid) {
+      return response.status(400).send({ success: false, details: "UID requerido." });
+    }
+
+    // --- Cargas base en paralelo ---
+    const [tag, items] = await Promise.all([
+      fetchTagByUID(uid),
+      fetchItemsByUid(uid)
+    ]);
+
+    if (!tag) {
+      return response.status(404).send({ success: false, details: "Etiqueta no encontrada." });
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      return response.status(404).send({ success: false, details: "No hay ítems asociados a este UID." });
+    }
+
+    // Orden estable de ítems (del más viejo al más nuevo) por created_at y luego item_id
+    const itemsSorted = items
+      .slice()
+      .sort((a, b) =>
+        Date.parse(a.created_at || 0) - Date.parse(b.created_at || 0) ||
+        (a.item_id - b.item_id)
+      );
+
+    const lastItem = itemsSorted[itemsSorted.length - 1];
+
+    // Producto del primer ítem
+    const product = await fetchProducById(itemsSorted[0].product_id);
+    if (!product) {
+      return response.status(404).send({ success: false, details: "Producto asociado no existe." });
+    }
+
+    // Relación en la ubicación actual (si existe)
+    const locationItem = await fetchLocationItem(lastItem.item_id, lastItem.location_id).catch(() => null);
+
+    // ---------- LINAGE: deduplicado y orden root->hijo ----------
+    // Recorremos hacia arriba por cada item, sin repetir item_id
+    const lineageAll = [];
+    const visited = new Set(); // item_id
+    for (const it of itemsSorted) {
+      let cur = it;
+      while (cur && !visited.has(cur.item_id)) {
+        lineageAll.push(cur);
+        visited.add(cur.item_id);
+        if (cur.parent_id == null) break;
+        cur = await fetchItemById(cur.parent_id);
+      }
+    }
+
+    // Si llegan duplicados (por recorrer varios caminos), prioriza el más reciente y dedup por nfc_uid/item_id
+    lineageAll.sort(
+      (a, b) =>
+        Date.parse(b.updated_at || b.created_at || 0) -
+        Date.parse(a.updated_at || a.created_at || 0)
+    );
+    const seenKeys = new Set(); // nfc_uid || item_id
+    const lineageDedup = lineageAll
+      .filter((x) => {
+        const key = x.nfc_uid || String(x.item_id);
+        if (seenKeys.has(key)) return false;
+        seenKeys.add(key);
+        return true;
+      })
+      .sort((a, b) => a.item_id - b.item_id); // root -> hijo
+
+    // ---------- TIMELINE DB COMPUESTO (root..hijo) ----------
+    // Para cada nodo del linaje, incluimos sus movimientos hasta el nacimiento del próximo nodo (split).
+    const lineageAsc = lineageDedup; // ya está root->hijo
+    const seenMovIds = new Set();
+    let movementsDbComposite = [];
+
+    for (let i = 0; i < lineageAsc.length; i++) {
+      const node = lineageAsc[i];
+      const next = lineageAsc[i + 1] || null;
+
+      // corte: cuando se creó el siguiente nodo (split); si no hay siguiente, infinito
+      const cutoff = next
+        ? Date.parse(next.created_at || next.updated_at || 0)
+        : Infinity;
+
+      const nodeMovs = await fetchMovementsByItemId(node.item_id).catch(() => []);
+      for (const mv of (nodeMovs || [])) {
+        const ts = Date.parse(mv.created_at || mv.ts || 0);
+        if (ts <= cutoff) {
+          if (!seenMovIds.has(mv.movement_id)) {
+            movementsDbComposite.push({
+              ...mv,
+              source_item_id: node.item_id,
+              is_ancestor: Boolean(next) // todo menos el último es ancestro
+            });
+            seenMovIds.add(mv.movement_id);
+          }
+        }
+      }
+    }
+
+    // Orden cronológico ascendente
+    movementsDbComposite.sort(
+      (a, b) => Date.parse(a.created_at || 0) - Date.parse(b.created_at || 0)
+    );
+
+    // ---------- ON-CHAIN para el UID actual ----------
+    let movementsChain = [];
+    try {
+      const raw = await fetchChainMovementsByUid(uid);         // [{ movement_type, location_id, ts, ... }]
+      const verified = await Promise.all(raw.map(verifyChainEvent)); // añade .verified si hay metadataURI+hash
+      movementsChain = verified.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
+    } catch (e) {
+      console.warn("Blockchain fetch failed:", e?.message || e);
+      movementsChain = [];
+    }
+
+    // ---------- Enriquecer con location_name (DB + chain) ----------
+    const locIds = new Set();
+    for (const mv of movementsDbComposite) {
+      if (mv.location_id != null) locIds.add(Number(mv.location_id));
+    }
+    for (const mv of movementsChain) {
+      if (mv.location_id != null) locIds.add(Number(mv.location_id));
+    }
+    if (locationItem?.location_id != null) {
+      locIds.add(Number(locationItem.location_id));
+    }
+
+    let locNameById = {};
+    if (locIds.size > 0) {
+      // Helper que te pasé antes
+      const rows = await fetchLocationsByIds([...locIds]).catch(() => []);
+      locNameById = Object.fromEntries(
+        (rows || []).map(r => [String(r.id), r.location_name])
+      );
+    }
+
+    const movementsDbEnriched = movementsDbComposite.map(m => ({
+      ...m,
+      location_name: m.location_name ?? locNameById[String(m.location_id)] ?? null
+    }));
+
+    const movementsChainEnriched = movementsChain.map(m => ({
+      ...m,
+      location_name: m.location_name ?? locNameById[String(m.location_id)] ?? null
+    }));
+
+    // ---------- Payload final ----------
+    const data = {
+      uid,
+      sku: product.sku,
+      product_name: product.product_name,
+      quantity: locationItem?.quantity ?? lastItem.item_quantity ?? tag.product_quantity ?? 0,
+      status: locationItem?.status ?? lastItem.status ?? null,
+      movements: movementsDbEnriched,          // ← timeline DB compuesto (root..hijo)
+      movements_chain: movementsChainEnriched, // ← on-chain del UID actual
+      lineage: lineageDedup                    // ← root -> hijo
+    };
+
+    return response.send({ success: true, data });
+
+  } catch (error) {
+    console.error(error);
+    return response.status(400).send({
+      success: false,
+      details: "Error al obtener historial del producto."
+    });
+  }
+}
+
+
 async function getWarehouseItems(request, response) {
     try {
         const { locationId } = request.body;
@@ -518,76 +839,162 @@ async function getInventory(request, response) {
     }
 }*/
 
+//helpers
+
+function tsFrom(val) {
+  if (!val) return NaN;
+  const n = Date.parse(val);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+async function firstMovementTs(itemId) {
+  const arr = await fetchMovementsByItemId(itemId).catch(() => []);
+  if (!arr || arr.length === 0) return NaN;
+  const first = arr.slice().sort((a,b) => tsFrom(a.created_at) - tsFrom(b.created_at))[0];
+  const t = tsFrom(first?.created_at);
+  return Number.isFinite(t) ? t : NaN;
+}
+
+// helpers
+
 async function getProductHistory(request, response) {
   try {
-    const { uid } = request.body; 
+    const tsFromMs = (val) => {
+      if (!val) return NaN;
+      const n = Date.parse(val);
+      return Number.isFinite(n) ? n : NaN;
+    };
 
-    const tag = await fetchTagByUID(uid);
-    const items = await fetchItemsByUid(uid);
-    const item = await fetchLocationItem(
-      items[items.length - 1].item_id,
-      items[items.length - 1].location_id
-    );
-    const product = await fetchProducById(items[0].product_id);
+    const firstChainTsMs = async (uidHex) => {
+      const arr = await fetchChainMovementsByUid(uidHex).catch(() => []);
+      if (!arr || arr.length === 0) return NaN;
+      const minSec = arr.reduce((m, e) => Math.min(m, Number(e.ts) || Infinity), Infinity);
+      return Number.isFinite(minSec) ? minSec * 1000 : NaN;
+    };
 
-    let movements = await fetchMovementsByItemId(item.item_id);
-
-    let lineage = [];
-    for (const it of items) {
-      let parentId = it.parent_id;
-      lineage.push(it);
-      while (parentId != null) {
-        const member = await fetchItemById(parentId);
-        lineage.push(member);
-        parentId = member.parent_id;
+    const buildLinearLineage = async (lastItem) => {
+      const chain = [];
+      const guard = new Set();
+      let cur = lastItem;
+      while (cur && !guard.has(cur.item_id)) {
+        chain.push(cur);
+        guard.add(cur.item_id);
+        if (cur.parent_id == null) break;
+        cur = await fetchItemById(cur.parent_id);
       }
-    }
-    movements.sort((a, b) => a.movement_id - b.movement_id);
-    lineage.sort(
-      (a, b) =>
-        Date.parse(b.updated_at || b.created_at || 0) -
-        Date.parse(a.updated_at || a.created_at || 0)
-    );
-    const seen = new Set();
-    lineage = lineage
-      .filter(x => {
-        const key = x.nfc_uid || String(x.item_id);
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .sort((a, b) => a.item_id - b.item_id);
+      return chain.reverse();
+    };
 
-    let movementsChain = [];
-    try {
-      const raw = await fetchChainMovementsByUid(uid);
-      movementsChain = await Promise.all(raw.map(verifyChainEvent));
-      movementsChain.sort((a, b) => a.ts - b.ts);
-    } catch (e) {
-      console.warn("Blockchain fetch failed:", e.message);
-      movementsChain = []; 
+    const buildCompositeChainTimeline = async (lineageRootToChild) => {
+      let out = [];
+      for (let i = 0; i < lineageRootToChild.length; i++) {
+        const node = lineageRootToChild[i];
+        const next = lineageRootToChild[i + 1] || null;
+
+        let cutoffMs = Infinity;
+        if (next) {
+          const c1 = await firstChainTsMs(String(next.nfc_uid || "").toUpperCase());
+          const c2 = tsFromMs(next.created_at) || tsFromMs(next.updated_at);
+          cutoffMs = Number.isFinite(c1) ? c1 : (Number.isFinite(c2) ? c2 : Infinity);
+        }
+
+        const nodeUid = String(node.nfc_uid || "").toUpperCase();
+        if (!nodeUid) continue;
+
+        const raw = await fetchChainMovementsByUid(nodeUid).catch(() => []);
+        const verified = await Promise.all(raw.map(verifyChainEvent));
+
+        const filtered = verified
+          .filter(ev => !next || (((ev.ts ?? 0) * 1000) <= cutoffMs))
+          .map(ev => ({
+            ...ev,
+            source_uid: nodeUid,
+            is_ancestor: Boolean(next)
+          }));
+
+        out = out.concat(filtered);
+      }
+      out.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0)); // por segundos UNIX
+      return out;
+    };
+
+    const rawUid = request.body?.uid ?? request.params?.uid;
+    const uid = String(rawUid || "").toUpperCase().trim();
+    if (!uid) {
+      return response.status(400).send({ success: false, details: "UID requerido." });
     }
+
+    const [tag, items] = await Promise.all([
+      fetchTagByUID(uid),
+      fetchItemsByUid(uid)
+    ]);
+
+    if (!tag) {
+      return response.status(404).send({ success: false, details: "Etiqueta no encontrada." });
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      return response.status(404).send({ success: false, details: "No hay ítems asociados a este UID." });
+    }
+
+    const itemsSorted = items.slice().sort(
+      (a, b) =>
+        tsFromMs(a.created_at) - tsFromMs(b.created_at) ||
+        (a.item_id - b.item_id)
+    );
+    const lastItem = itemsSorted[itemsSorted.length - 1];
+
+    const product = await fetchProducById(itemsSorted[0].product_id);
+    if (!product) {
+      return response.status(404).send({ success: false, details: "Producto asociado no existe." });
+    }
+
+    const locationItem = await fetchLocationItem(lastItem.item_id, lastItem.location_id).catch(() => null);
+
+    const lineage = await buildLinearLineage(lastItem);
+
+    const movementsChainComposite = await buildCompositeChainTimeline(lineage);
+
+    const locIds = new Set();
+    for (const mv of movementsChainComposite) {
+      if (mv.location_id != null) locIds.add(Number(mv.location_id));
+    }
+    if (locationItem?.location_id != null) locIds.add(Number(locationItem.location_id));
+
+    let locNameById = {};
+    if (locIds.size > 0) {
+      const rows = await fetchLocationsByIds([...locIds]).catch(() => []);
+      locNameById = Object.fromEntries(
+        (rows || []).map(r => [String(r.id), r.location_name])
+      );
+    }
+
+    const movementsChainEnriched = movementsChainComposite.map(m => ({
+      ...m,
+      location_name: m.location_name ?? locNameById[String(m.location_id)] ?? null
+    }));
 
     const data = {
       uid,
       sku: product.sku,
       product_name: product.product_name,
-      quantity: item.quantity,
-      status: item.status,
-      movements,            
-      movements_chain: movementsChain,
-      lineage
+      quantity: locationItem?.quantity ?? lastItem.item_quantity ?? tag.product_quantity ?? 0,
+      status: locationItem?.status ?? lastItem.status ?? null,
+      lineage,                          // root → … → hijo (de tu DB)
+      movements_chain: movementsChainEnriched // SOLO blockchain
     };
 
     return response.send({ success: true, data });
+
   } catch (error) {
     console.error(error);
     return response.status(400).send({
       success: false,
-      details: "Error al obtener historial del producto."
+      details: "Error al obtener historial del producto (on-chain)."
     });
   }
 }
+
+
 
 module.exports = {
     getProducts,
