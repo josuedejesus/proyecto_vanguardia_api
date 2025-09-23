@@ -1,6 +1,6 @@
 const { response, move } = require("../app");
 const knex = require("../db/knex");
-const { logMovement, fetchChainMovementsByUid, verifyChainEvent } = require("../services/blockchainClient");
+const { logMovement, fetchChainMovementsByUid, verifyChainEvent, getTransactionData, fetchTransactionData } = require("../services/blockchainClient");
 const { fetchLocationsByIds } = require("../services/locations");
 const { insertMovement, fetchMovementsByItemId, fetchRawMovementsByItemId, insertItemMovement, fetchItemMovements, updateMovementHash } = require("../services/movements");
 
@@ -547,14 +547,12 @@ async function divideBatch(request, response) {
 
 async function getProductHistory(request, response) {
   try {
-    // --- UID normalizado ---
     const rawUid = request.body?.uid ?? request.params?.uid;
     const uid = String(rawUid || "").toUpperCase().trim();
     if (!uid) {
       return response.status(400).send({ success: false, details: "UID requerido." });
     }
 
-    // --- Cargas base en paralelo ---
     const [tag, items] = await Promise.all([
       fetchTagByUID(uid),
       fetchItemsByUid(uid)
@@ -567,7 +565,6 @@ async function getProductHistory(request, response) {
       return response.status(404).send({ success: false, details: "No hay ítems asociados a este UID." });
     }
 
-    // Orden estable de ítems (del más viejo al más nuevo) por created_at y luego item_id
     const itemsSorted = items
       .slice()
       .sort((a, b) =>
@@ -577,19 +574,15 @@ async function getProductHistory(request, response) {
 
     const lastItem = itemsSorted[itemsSorted.length - 1];
 
-    // Producto del primer ítem
     const product = await fetchProducById(itemsSorted[0].product_id);
     if (!product) {
       return response.status(404).send({ success: false, details: "Producto asociado no existe." });
     }
 
-    // Relación en la ubicación actual (si existe)
     const locationItem = await fetchLocationItem(lastItem.item_id, lastItem.location_id).catch(() => null);
 
-    // ---------- LINAGE: deduplicado y orden root->hijo ----------
-    // Recorremos hacia arriba por cada item, sin repetir item_id
     const lineageAll = [];
-    const visited = new Set(); // item_id
+    const visited = new Set(); 
     for (const it of itemsSorted) {
       let cur = it;
       while (cur && !visited.has(cur.item_id)) {
@@ -600,13 +593,12 @@ async function getProductHistory(request, response) {
       }
     }
 
-    // Si llegan duplicados (por recorrer varios caminos), prioriza el más reciente y dedup por nfc_uid/item_id
     lineageAll.sort(
       (a, b) =>
         Date.parse(b.updated_at || b.created_at || 0) -
         Date.parse(a.updated_at || a.created_at || 0)
     );
-    const seenKeys = new Set(); // nfc_uid || item_id
+    const seenKeys = new Set(); 
     const lineageDedup = lineageAll
       .filter((x) => {
         const key = x.nfc_uid || String(x.item_id);
@@ -614,11 +606,9 @@ async function getProductHistory(request, response) {
         seenKeys.add(key);
         return true;
       })
-      .sort((a, b) => a.item_id - b.item_id); // root -> hijo
+      .sort((a, b) => a.item_id - b.item_id); 
 
-    // ---------- TIMELINE DB COMPUESTO (root..hijo) ----------
-    // Para cada nodo del linaje, incluimos sus movimientos hasta el nacimiento del próximo nodo (split).
-    const lineageAsc = lineageDedup; // ya está root->hijo
+    const lineageAsc = lineageDedup; 
     const seenMovIds = new Set();
     let movementsDbComposite = [];
 
@@ -626,7 +616,6 @@ async function getProductHistory(request, response) {
       const node = lineageAsc[i];
       const next = lineageAsc[i + 1] || null;
 
-      // corte: cuando se creó el siguiente nodo (split); si no hay siguiente, infinito
       const cutoff = next
         ? Date.parse(next.created_at || next.updated_at || 0)
         : Infinity;
@@ -639,7 +628,7 @@ async function getProductHistory(request, response) {
             movementsDbComposite.push({
               ...mv,
               source_item_id: node.item_id,
-              is_ancestor: Boolean(next) // todo menos el último es ancestro
+              is_ancestor: Boolean(next)
             });
             seenMovIds.add(mv.movement_id);
           }
@@ -647,23 +636,20 @@ async function getProductHistory(request, response) {
       }
     }
 
-    // Orden cronológico ascendente
     movementsDbComposite.sort(
       (a, b) => Date.parse(a.created_at || 0) - Date.parse(b.created_at || 0)
     );
 
-    // ---------- ON-CHAIN para el UID actual ----------
     let movementsChain = [];
     try {
-      const raw = await fetchChainMovementsByUid(uid);         // [{ movement_type, location_id, ts, ... }]
-      const verified = await Promise.all(raw.map(verifyChainEvent)); // añade .verified si hay metadataURI+hash
+      const raw = await fetchChainMovementsByUid(uid);       
+      const verified = await Promise.all(raw.map(verifyChainEvent)); 
       movementsChain = verified.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
     } catch (e) {
       console.warn("Blockchain fetch failed:", e?.message || e);
       movementsChain = [];
     }
 
-    // ---------- Enriquecer con location_name (DB + chain) ----------
     const locIds = new Set();
     for (const mv of movementsDbComposite) {
       if (mv.location_id != null) locIds.add(Number(mv.location_id));
@@ -677,7 +663,6 @@ async function getProductHistory(request, response) {
 
     let locNameById = {};
     if (locIds.size > 0) {
-      // Helper que te pasé antes
       const rows = await fetchLocationsByIds([...locIds]).catch(() => []);
       locNameById = Object.fromEntries(
         (rows || []).map(r => [String(r.id), r.location_name])
@@ -694,16 +679,15 @@ async function getProductHistory(request, response) {
       location_name: m.location_name ?? locNameById[String(m.location_id)] ?? null
     }));
 
-    // ---------- Payload final ----------
     const data = {
       uid,
       sku: product.sku,
       product_name: product.product_name,
       quantity: locationItem?.quantity ?? lastItem.item_quantity ?? tag.product_quantity ?? 0,
       status: locationItem?.status ?? lastItem.status ?? null,
-      movements: movementsDbEnriched,          // ← timeline DB compuesto (root..hijo)
-      movements_chain: movementsChainEnriched, // ← on-chain del UID actual
-      lineage: lineageDedup                    // ← root -> hijo
+      movements: movementsDbEnriched,          
+      movements_chain: movementsChainEnriched, 
+      lineage: lineageDedup           
     };
 
     return response.send({ success: true, data });
@@ -995,6 +979,26 @@ async function getProductHistory(request, response) {
 }
 
 
+async function getTransaction(request, response) {
+    try {
+        const { hash } = request.body;
+
+        const data = await fetchTransactionData(hash);
+
+        response.send({
+            success: true,
+            data: data
+        })
+
+        console.log(data);
+    } catch (error) {
+        response.status(400).send({
+            success: false,
+            details: 'Error al obtener datos de transaccion.'
+        })
+    }
+}
+
 
 module.exports = {
     getProducts,
@@ -1006,5 +1010,6 @@ module.exports = {
     getWarehouseItems,
     divideBatch,
     getInventory,
-    getProductHistory
+    getProductHistory,
+    getTransaction
 }

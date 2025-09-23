@@ -14,6 +14,7 @@ router.post('/get-items', productsController.getWarehouseItems);
 router.post('/divide-batch', productsController.divideBatch);
 router.post('/get-inventory', productsController.getInventory);
 router.post('/get-product-passport', productsController.getProductHistory);
+router.post('/get-transaction', productsController.getTransaction);
 
 
 module.exports = router;

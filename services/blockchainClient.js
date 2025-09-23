@@ -1,7 +1,5 @@
-// services/blockchainClient.js
 const crypto = require("crypto");
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
-// Para verificación del hash (keccak256) – mismo algoritmo que on-chain
 const { keccak256, toUtf8Bytes } = require("ethers");
 
 const BLOCKCHAIN_URL = process.env.BLOCKCHAIN_URL || "http://127.0.0.1:4001";
@@ -12,7 +10,6 @@ function sign(body, ts) {
   return crypto.createHmac("sha256", HMAC_SHARED_SECRET).update(payload + ts).digest("hex");
 }
 
-// Ordena claves para que el hash sea estable
 function stableStringify(o) {
   const keys = [];
   JSON.stringify(o, (k, v) => (keys.push(k), v));
@@ -20,7 +17,6 @@ function stableStringify(o) {
   return JSON.stringify(o, keys);
 }
 
-/** ---- POST: publicar movimiento ---- */
 async function logMovement(body) {
   const ts = Math.floor(Date.now() / 1000).toString();
   const sig = sign(body, ts);
@@ -35,28 +31,25 @@ async function logMovement(body) {
     body: JSON.stringify(body)
   });
   if (!r.ok) throw new Error(`blockchain ${r.status}: ${await r.text()}`);
-  return r.json(); // { txHash, blockNumber, latestHash }
+  return r.json(); 
 }
 
-/** ---- GET: timeline on-chain para un UID ---- */
 async function getChainMovements(uidHex) {
   const r = await fetch(`${BLOCKCHAIN_URL}/movements/${uidHex}`);
   if (!r.ok) throw new Error(`blockchain ${r.status}: ${await r.text()}`);
   const { items = [] } = await r.json();
-  // Normaliza tipos numéricos
   return items.map(ev => ({
     tx_hash: ev.txHash,
     block_number: Number(ev.blockNumber),
     movement_type: Number(ev.movementType),
     quantity: Number(ev.quantity),
     location_id: Number(ev.locationId),
-    ts: Number(ev.ts),                          // UNIX seconds
+    ts: Number(ev.ts),                          
     metadata_uri: ev.metadataURI || "",
-    content_hash: ev.contentHash || null        // asegúrate de exponerlo en el servicio
+    content_hash: ev.contentHash || null     
   }));
 }
 
-/** ---- GET: latestHash (cabeza) para un UID ---- */
 async function getLatestHash(uidHex) {
   const r = await fetch(`${BLOCKCHAIN_URL}/movements/latest/${uidHex}`);
   if (!r.ok) throw new Error(`blockchain ${r.status}: ${await r.text()}`);
@@ -64,7 +57,6 @@ async function getLatestHash(uidHex) {
   return latestHash;
 }
 
-/** ---- Verificar eventos contra su metadataURI ---- */
 async function verifyChainMovements(movs) {
   return Promise.all(movs.map(async ev => {
     if (!ev.metadata_uri || !ev.content_hash) return { ...ev, verified: null };
@@ -86,14 +78,12 @@ function stableStringify(o) {
   return JSON.stringify(o, keys);
 }
 
-// trae timeline on-chain para un UID (desde tu blockchain-service)
 async function fetchChainMovementsByUid(uidHex) {
   const url = `${BLOCKCHAIN_URL}/movements/${uidHex}`;
   const r = await fetch(url);
   if (!r.ok) throw new Error(`blockchain ${r.status}: ${await r.text()}`);
   const { items = [] } = await r.json();
 
-  // Normaliza a un shape consistente y numérico
   return items.map(ev => ({
     source: "chain",
     tx_hash: ev.txHash,
@@ -101,19 +91,16 @@ async function fetchChainMovementsByUid(uidHex) {
     movement_type: Number(ev.movementType),
     quantity: Number(ev.quantity),
     location_id: Number(ev.locationId),
-    ts: Number(ev.ts),                       // segundos UNIX
+    ts: Number(ev.ts),                       
     at_iso: new Date(Number(ev.ts) * 1000).toISOString(),
     metadata_uri: ev.metadataURI || "",
-    // contentHash es clave para verificación; asegúrate de exponerlo en el servicio:
-    // event.args.contentHash -> incluirlo como ev.contentHash
     content_hash: ev.contentHash || null,
   }));
 }
 
-// intenta verificar un evento on-chain comparando el hash del metadataURI
 async function verifyChainEvent(ev) {
   if (!ev.metadata_uri || !ev.content_hash) {
-    return { ...ev, verified: null }; // no verificable (falta data)
+    return { ...ev, verified: null }; 
   }
   try {
     const meta = await fetch(ev.metadata_uri).then(r => r.json());
@@ -121,9 +108,58 @@ async function verifyChainEvent(ev) {
     const ok = localHash.toLowerCase() === ev.content_hash.toLowerCase();
     return { ...ev, verified: ok, meta_snapshot: meta };
   } catch {
-    return { ...ev, verified: null }; // metadata inaccesible
+    return { ...ev, verified: null }; 
   }
 }
+
+
+async function fetchTransactionData(txHash) {
+  if (!txHash || !/^0x[0-9a-fA-F]{64}$/.test(String(txHash))) {
+    throw new Error("Invalid tx hash");
+  }
+
+  const r = await fetch(`${BLOCKCHAIN_URL}/tx/${txHash}`);
+  if (!r.ok) {
+    // propaga el detalle del backend
+    throw new Error(`blockchain ${r.status}: ${await r.text()}`);
+  }
+  const data = await r.json();
+
+  // Normalización ligera para tipos y estructura
+  const toNum = (v) => (v == null ? null : Number(v));
+  const toStr = (v) => (v == null ? null : String(v));
+
+  const logs = Array.isArray(data.logs)
+    ? data.logs.map((lg) => ({
+        name: lg.name,
+        logIndex: toNum(lg.logIndex),
+        address: toStr(lg.address),
+        // args ya vienen decodificados por el backend; los dejamos tal cual
+        args: lg.args || {},
+      }))
+    : [];
+
+  return {
+    hash: toStr(data.hash),
+    from: toStr(data.from),
+    to: toStr(data.to),
+    nonce: toNum(data.nonce),
+    value_wei: toStr(data.value_wei),
+    gasPrice_wei: toStr(data.gasPrice_wei),
+    blockNumber: toNum(data.blockNumber),
+    status: data.status, // 1 success, 0 failed, null pending
+    gasUsed: toStr(data.gasUsed),
+    cumulativeGasUsed: toStr(data.cumulativeGasUsed),
+    timestamp: toNum(data.timestamp),            // segundos UNIX
+    timestamp_iso: toStr(data.timestamp_iso),    // ISO string
+    logs,                                        // eventos parseados
+    // Si necesitas los crudos para debug, puedes exponerlos también:
+    // raw: data.raw
+  };
+}
+
+
+
 
 module.exports = {
   logMovement,
@@ -131,5 +167,6 @@ module.exports = {
   getLatestHash,
   verifyChainMovements,
   fetchChainMovementsByUid,
-  verifyChainEvent
+  verifyChainEvent,
+  fetchTransactionData
 };
